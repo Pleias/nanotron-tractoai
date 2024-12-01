@@ -2,7 +2,7 @@ import datetime
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import List, Optional, Type, Union
+from typing import List, Optional, Type, Union, Literal
 
 import dacite
 import torch
@@ -121,10 +121,40 @@ class NanosetDatasetsArgs:
 
 
 @dataclass
+class TractoTableDatasetArgs:
+    tracto_dataset: Literal["yt_table"]
+    # it's much better to merge multiple tables into single one
+    yt_dataset_path: str
+    dataset_batch_size: int
+
+
+@dataclass
+class TractoFsFileDatasetArgs:
+    tracto_dataset: Literal["yt_fs_file"]
+    yt_dataset_path: list[str]
+    dataset_weights: Optional[List[float]] = None
+
+
+@dataclass
+class TractoMemFileDatasetArgs:
+    tracto_dataset: Literal["yt_mem_file"]
+    yt_dataset_path: list[str]
+    dataset_weights: Optional[List[float]] = None
+
+
+@dataclass
 class DataArgs:
     """Arguments related to the data and data files processing"""
 
-    dataset: Optional[Union[PretrainDatasetsArgs, NanosetDatasetsArgs]]
+    dataset: Optional[
+        Union[
+            PretrainDatasetsArgs,
+            NanosetDatasetsArgs,
+            TractoMemFileDatasetArgs,
+            TractoTableDatasetArgs,
+            TractoFsFileDatasetArgs,
+        ]
+    ]
     seed: Optional[int]
     num_loading_workers: Optional[int] = 1
 
@@ -166,6 +196,16 @@ class CheckpointsArgs:
             self.checkpoints_path = xPath(self.checkpoints_path)
         if isinstance(self.resume_checkpoint_path, str):
             self.resume_checkpoint_path = xPath(self.resume_checkpoint_path)
+
+
+@dataclass
+class TractoCheckpointsArgs:
+    checkpoints_path: str
+    resume_checkpoint_path: Optional[str] = None
+    checkpoints_medium: Optional[str] = None
+    load_last_checkpoint: bool = False
+    tmpfs_path: Optional[str] = None
+    use_async_saver: bool = False
 
 
 @dataclass
@@ -351,6 +391,7 @@ class Config:
     profiler: Optional[ProfilerArgs] = None
     lighteval: Optional[LightEvalConfig] = None
     s3_upload: Optional[S3UploadArgs] = None
+    tracto_checkpoints: Optional[TractoCheckpointsArgs] = None
 
     @classmethod
     def create_empty(cls):
@@ -402,11 +443,13 @@ class Config:
     def global_batch_size(self):
         return self.tokens.micro_batch_size * self.tokens.batch_accumulation_per_replica * self.parallelism.dp
 
-    def save_as_yaml(self, file_path: str):
+    def save_as_bytes(self) -> bytes:
         config_dict = serialize(self)
-        file_path = str(file_path)
-        with open(file_path, "w") as f:
-            yaml.dump(config_dict, f)
+        return yaml.dump(config_dict).encode()
+
+    def save_as_yaml(self, file_path: str):
+        with open(file_path, "wb") as f:
+            f.write(self.save_as_bytes())
 
         # Sanity test config can be reloaded
         _ = get_config_from_file(file_path, config_class=self.__class__)
@@ -456,6 +499,30 @@ def get_config_from_dict(
     )
 
 
+def get_config_from_bytes(
+    config_bytes: bytes,
+    config_class: Type = Config,
+    model_config_class: Optional[Type] = None,
+    skip_unused_config_keys: bool = False,
+    skip_null_keys: bool = False,
+) -> Config:
+    """Get a config object from bytes (YAML)"""
+    config_dict = yaml.load(config_bytes, Loader=SafeLoader)
+    config = get_config_from_dict(
+        config_dict,
+        config_class=config_class,
+        skip_unused_config_keys=skip_unused_config_keys,
+        skip_null_keys=skip_null_keys,
+    )
+    if model_config_class is not None:
+        if not isinstance(config.model.model_config, (dict, model_config_class)):
+            raise ValueError(
+                f"model_config should be a dictionary or a {model_config_class} and not {config.model.model_config}"
+            )
+        config.model.model_config = model_config_class(**config.model.model_config)
+    return config
+
+
 def get_config_from_file(
     config_path: str,
     config_class: Type = Config,
@@ -473,20 +540,12 @@ def get_config_from_file(
         skip_unused_config_keys: whether to skip unused first-nesting-level keys in the config file (for config with additional sections)
         skip_null_keys: whether to skip keys with value None at first and second nesting level
     """
-    # Open the file and load the file
-    with open(config_path) as f:
-        config_dict = yaml.load(f, Loader=SafeLoader)
-
-    config = get_config_from_dict(
-        config_dict,
-        config_class=config_class,
-        skip_unused_config_keys=skip_unused_config_keys,
-        skip_null_keys=skip_null_keys,
+    with open(config_path, "rb") as f:
+        config_bytes = f.read()
+    return get_config_from_bytes(
+        config_bytes,
+        config_class,
+        model_config_class,
+        skip_unused_config_keys,
+        skip_null_keys,
     )
-    if model_config_class is not None:
-        if not isinstance(config.model.model_config, (dict, model_config_class)):
-            raise ValueError(
-                f"model_config should be a dictionary or a {model_config_class} and not {config.model.model_config}"
-            )
-        config.model.model_config = model_config_class(**config.model.model_config)
-    return config

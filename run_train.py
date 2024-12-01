@@ -7,13 +7,17 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # important for some distributed operations
 torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llama.yaml
 ```
 """
+import os
 import argparse
 from typing import Dict, cast
 
 import numpy as np
 from nanotron import logging
-from nanotron.config import DataArgs, DatasetStageArgs, NanosetDatasetsArgs, PretrainDatasetsArgs
+from nanotron.config import DataArgs, DatasetStageArgs, NanosetDatasetsArgs, PretrainDatasetsArgs, \
+    TractoFsFileDatasetArgs, \
+    TractoMemFileDatasetArgs, TractoTableDatasetArgs
 from nanotron.data.dataloader_builder import build_nanoset_dataloader
+from nanotron.data.tractoloader import build_tractoloader
 from nanotron.dataloader import (
     clm_process,
     dummy_infinite_data_generator,
@@ -29,6 +33,9 @@ from nanotron.parallel.pipeline_parallel.utils import get_input_output_pp_ranks
 from nanotron.trainer import DistributedTrainer
 from nanotron.utils import main_rank_first
 from torch.utils.data import DataLoader
+
+from tractorun.run import prepare_and_get_toolbox
+from tractorun.backend.tractorch import Tractorch
 
 try:
     from huggingface_hub import __version__ as hf_hub_version
@@ -172,6 +179,55 @@ def get_dataloader_from_data_stage(
         )
 
         return train_dataloader
+    elif isinstance(data.dataset, (TractoFsFileDatasetArgs, TractoMemFileDatasetArgs)):
+        tokenizer = AutoTokenizer.from_pretrained(trainer.config.tokenizer.tokenizer_name_or_path)
+        token_size = 4 if len(tokenizer) > np.iinfo(np.uint16).max + 1 else 2
+        del tokenizer
+        from nanotron.data.tractoset import TractoFsFileDataset, TractoMemFileDataset
+        dataset_type = TractoFsFileDataset if isinstance(data.dataset, TractoFsFileDatasetArgs) else TractoMemFileDataset
+        with main_rank_first(trainer.parallel_context.world_pg):
+            train_dataset = dataset_type(
+                yt_client=toolbox.yt_client,
+                yt_dataset_paths=data.dataset.yt_dataset_path,
+                dataset_weights=data.dataset.dataset_weights,
+                sequence_length=trainer.sequence_length,
+                token_size=token_size,
+                train_split_num_samples=trainer.config.tokens.train_steps * trainer.global_batch_size,
+                random_seed=data.seed,
+            )
+            train_dataloader = build_nanoset_dataloader(
+                train_dataset,
+                trainer.sequence_length,
+                parallel_context=trainer.parallel_context,
+                input_pp_rank=input_pp_rank,
+                output_pp_rank=output_pp_rank,
+                micro_batch_size=trainer.micro_batch_size,
+                consumed_train_samples=consumed_train_samples,
+                dataloader_num_workers=data.num_loading_workers,
+                dataloader_drop_last=True,
+            )
+            return train_dataloader
+    elif isinstance(data.dataset, TractoTableDatasetArgs):
+        from nanotron.data.tractoset import TractoTableDataset
+        with main_rank_first(trainer.parallel_context.world_pg):
+            train_dataset = TractoTableDataset(
+                yt_client=toolbox.yt_client,
+                path=data.dataset.yt_dataset_path,
+                batch_size=data.dataset.dataset_batch_size,
+                sequence_length=trainer.sequence_length,
+            )
+            train_dataloader = build_tractoloader(
+                train_dataset,
+                parallel_context=trainer.parallel_context,
+                input_pp_rank=input_pp_rank,
+                output_pp_rank=output_pp_rank,
+                micro_batch_size=trainer.micro_batch_size,
+                consumed_train_samples=consumed_train_samples,
+                dataloader_num_workers=data.num_loading_workers,
+                dataloader_drop_last=True,
+            )
+
+            return train_dataloader
     else:
         raise ValueError(f"Unhandled case of `self.config.data.dataset`. Got: {data.dataset}")
 
@@ -226,11 +282,13 @@ def get_args():
 
 
 if __name__ == "__main__":
+    toolbox = prepare_and_get_toolbox(backend=Tractorch())
+    os.environ["RANK"] = str(toolbox.coordinator.get_self_index())
     args = get_args()
     config_file = args.config_file
 
     # Load trainer and data
-    trainer = DistributedTrainer(config_file)
+    trainer = DistributedTrainer(config_file, toolbox=toolbox)
     dataloader = get_dataloader(trainer)
 
     # Train
